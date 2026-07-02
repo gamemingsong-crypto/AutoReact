@@ -136,7 +136,7 @@ const commands = [
 // ----------------------------------------------------------------
 client.once('ready', async () => {
     console.log(`🚀 ${client.user.tag} พร้อมทำงานแล้ว!`);
-    client.user.setActivity('/autoreact | Auto Reaction', { type: ActivityType.Watching });
+    client.user.setActivity('ส่งใจแบบออโต้ | /autoreact', { type: ActivityType.Watching });
 
     const rest = new REST({ version: '10' }).setToken(TOKEN);
     try {
