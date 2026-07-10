@@ -32,6 +32,7 @@ const client = new Client({
 
 const TOKEN = process.env.DISCORD_TOKEN;
 const CONFIG_PATH = './config.json';
+const PRESENCE_REFRESH_MS = 5 * 60 * 1000;
 
 // ----------------------------------------------------------------
 // 💾 ระบบเก็บค่าคอนฟิก
@@ -56,6 +57,12 @@ function saveConfig() {
 }
 
 let config = loadConfig();
+
+function applyPresence() {
+    client.user?.setActivity('/autoreact | Auto Reaction', {
+        type: ActivityType.Watching,
+    });
+}
 
 // ----------------------------------------------------------------
 // 🖼️ เช็กว่าข้อความมีรูป/ไฟล์แนบ/Embed รูปไหม
@@ -174,9 +181,8 @@ const commands = [
 client.once('clientReady', async () => {
     console.log(`🚀 ${client.user.tag} พร้อมทำงานแล้ว!`);
 
-    client.user.setActivity('/autoreact | Auto Reaction', {
-        type: ActivityType.Watching,
-    });
+    applyPresence();
+    setInterval(applyPresence, PRESENCE_REFRESH_MS);
 
     const rest = new REST({ version: '10' }).setToken(TOKEN);
 
@@ -195,6 +201,8 @@ client.once('clientReady', async () => {
         console.error('❌ ลงทะเบียน Slash Command ไม่สำเร็จ:', err);
     }
 });
+
+client.on('shardResume', applyPresence);
 
 // ----------------------------------------------------------------
 // 🎯 Auto React ข้อความใหม่
