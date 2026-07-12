@@ -32,7 +32,8 @@ const client = new Client({
 
 const TOKEN = process.env.DISCORD_TOKEN;
 const CONFIG_PATH = './config.json';
-const PRESENCE_REFRESH_MS = 5 * 60 * 1000;
+const PRESENCE_ACTIVITY = 'ส่งอีโมจิออโต้ | /autoreact';
+const PRESENCE_REFRESH_MS = 60 * 1000;
 
 // ----------------------------------------------------------------
 // 💾 ระบบเก็บค่าคอนฟิก
@@ -57,11 +58,33 @@ function saveConfig() {
 }
 
 let config = loadConfig();
+let presenceHeartbeat = null;
+let presenceHeartbeatCount = 0;
 
-function applyPresence() {
-    client.user?.setActivity('/autoreact | Auto Reaction', {
-        type: ActivityType.Watching,
+function applyPresence(reason = 'heartbeat') {
+    if (!client.isReady() || !client.user) return;
+
+    client.user.setPresence({
+        status: 'online',
+        afk: false,
+        activities: [{
+            name: PRESENCE_ACTIVITY,
+            type: ActivityType.Watching,
+        }],
     });
+
+    presenceHeartbeatCount += 1;
+    if (reason !== 'heartbeat' || presenceHeartbeatCount % 10 === 0) {
+        console.log(`[presence] refreshed (${reason}, pid=${process.pid})`);
+    }
+}
+
+function startPresenceHeartbeat() {
+    if (presenceHeartbeat) clearInterval(presenceHeartbeat);
+
+    applyPresence('clientReady');
+    presenceHeartbeat = setInterval(() => applyPresence(), PRESENCE_REFRESH_MS);
+    console.log(`[presence] heartbeat active every ${PRESENCE_REFRESH_MS / 1000}s`);
 }
 
 // ----------------------------------------------------------------
@@ -181,8 +204,7 @@ const commands = [
 client.once('clientReady', async () => {
     console.log(`🚀 ${client.user.tag} พร้อมทำงานแล้ว!`);
 
-    applyPresence();
-    setInterval(applyPresence, PRESENCE_REFRESH_MS);
+    startPresenceHeartbeat();
 
     const rest = new REST({ version: '10' }).setToken(TOKEN);
 
@@ -202,7 +224,8 @@ client.once('clientReady', async () => {
     }
 });
 
-client.on('shardResume', applyPresence);
+client.on('shardReady', (shardId) => applyPresence(`shardReady:${shardId}`));
+client.on('shardResume', (shardId) => applyPresence(`shardResume:${shardId}`));
 
 // ----------------------------------------------------------------
 // 🎯 Auto React ข้อความใหม่
