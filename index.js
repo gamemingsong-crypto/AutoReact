@@ -1,470 +1,430 @@
-import 'dotenv/config';
-import express from 'express';
-import fs from 'fs';
+import "dotenv/config";
+import { readFile } from "node:fs/promises";
 import {
-    Client,
-    GatewayIntentBits,
-    PermissionsBitField,
-    ActivityType,
-    REST,
-    Routes,
-    SlashCommandBuilder,
-    ChannelType,
-    EmbedBuilder,
-} from 'discord.js';
+  ActivityType,
+  Client,
+  Events,
+  GatewayIntentBits,
+  Partials,
+  PermissionFlagsBits
+} from "discord.js";
+import { ConfigStore } from "./configStore.js";
 
-// 🌐 Web Server กันบอทหลับ / ใช้กับ Render หรือ VPS
-const app = express();
-app.get('/', (req, res) => res.send('Auto React Bot is Alive!'));
-app.listen(process.env.PORT || 3006, () => {
-    console.log(`🌐 Web server listening on port ${process.env.PORT || 3006}`);
-});
+async function readJson(filePath) {
+  try {
+    return JSON.parse(await readFile(filePath, "utf8"));
+  } catch {
+    return {};
+  }
+}
 
-// 🤖 ตั้งค่าบอทและ Intents
-const client = new Client({
-    intents: [
-        GatewayIntentBits.Guilds,
-        GatewayIntentBits.GuildMessages,
-        GatewayIntentBits.MessageContent,
-        GatewayIntentBits.GuildMessageReactions,
-    ],
-});
+function pickConfig(config, ...keys) {
+  for (const key of keys) {
+    if (process.env[key]) return process.env[key];
+  }
 
-const TOKEN = process.env.DISCORD_TOKEN;
-const CONFIG_PATH = './config.json';
-const PRESENCE_ACTIVITY = 'ส่งอีโมจิออโต้ | /autoreact';
+  const flat = new Map();
+  const visit = (value) => {
+    if (!value || typeof value !== "object") return;
+    for (const [key, nestedValue] of Object.entries(value)) {
+      if (nestedValue && typeof nestedValue === "object" && !Array.isArray(nestedValue)) {
+        visit(nestedValue);
+      } else {
+        flat.set(key.toLowerCase().replace(/[^a-z0-9]/g, ""), nestedValue);
+      }
+    }
+  };
+
+  visit(config);
+
+  for (const key of keys) {
+    const value = flat.get(key.toLowerCase().replace(/[^a-z0-9]/g, ""));
+    if (value) return String(value);
+  }
+
+  return "";
+}
+
+const config = await readJson("./config.json");
+const DISCORD_TOKEN = pickConfig(
+  config,
+  "DISCORD_TOKEN",
+  "TOKEN",
+  "BOT_TOKEN",
+  "CLIENT_TOKEN"
+);
+const DATA_FILE = process.env.DATA_FILE || "./data/rules.json";
+
+if (!DISCORD_TOKEN) {
+  throw new Error("Missing DISCORD_TOKEN/TOKEN in .env or config.json");
+}
+
+const store = new ConfigStore(DATA_FILE);
+await store.load();
+const PRESENCE_ACTIVITY = "ส่งอีโมจิออโต้ | /autoreact";
 const PRESENCE_REFRESH_MS = 60 * 1000;
 
-// ----------------------------------------------------------------
-// 💾 ระบบเก็บค่าคอนฟิก
-// ----------------------------------------------------------------
-function loadConfig() {
-    if (!fs.existsSync(CONFIG_PATH)) {
-        const initial = { enabled: true, channels: {} };
-        fs.writeFileSync(CONFIG_PATH, JSON.stringify(initial, null, 2));
-        return initial;
-    }
+const client = new Client({
+  intents: [
+    GatewayIntentBits.Guilds,
+    GatewayIntentBits.GuildMessages,
+    GatewayIntentBits.MessageContent
+  ],
+  partials: [Partials.Channel, Partials.Message]
+});
 
-    try {
-        return JSON.parse(fs.readFileSync(CONFIG_PATH, 'utf8'));
-    } catch (err) {
-        console.error('❌ อ่านไฟล์ config.json ไม่ได้ ใช้ค่าเริ่มต้นแทน:', err);
-        return { enabled: true, channels: {} };
-    }
-}
-
-function saveConfig() {
-    fs.writeFileSync(CONFIG_PATH, JSON.stringify(config, null, 2));
-}
-
-let config = loadConfig();
 let presenceHeartbeat = null;
 let presenceHeartbeatCount = 0;
 
-function applyPresence(reason = 'heartbeat') {
-    if (!client.isReady() || !client.user) return;
+function applyPresence(reason = "heartbeat") {
+  if (!client.isReady() || !client.user) return;
 
-    client.user.setPresence({
-        status: 'online',
-        afk: false,
-        activities: [{
-            name: PRESENCE_ACTIVITY,
-            type: ActivityType.Watching,
-        }],
-    });
+  client.user.setPresence({
+    status: "online",
+    afk: false,
+    activities: [{
+      name: PRESENCE_ACTIVITY,
+      type: ActivityType.Watching
+    }]
+  });
 
-    presenceHeartbeatCount += 1;
-    if (reason !== 'heartbeat' || presenceHeartbeatCount % 10 === 0) {
-        console.log(`[presence] refreshed (${reason}, pid=${process.pid})`);
-    }
+  presenceHeartbeatCount += 1;
+  if (reason !== "heartbeat" || presenceHeartbeatCount % 10 === 0) {
+    console.log(`[presence] refreshed (${reason}, pid=${process.pid})`);
+  }
 }
 
 function startPresenceHeartbeat() {
-    if (presenceHeartbeat) clearInterval(presenceHeartbeat);
+  if (presenceHeartbeat) clearInterval(presenceHeartbeat);
 
-    applyPresence('clientReady');
-    presenceHeartbeat = setInterval(() => applyPresence(), PRESENCE_REFRESH_MS);
-    console.log(`[presence] heartbeat active every ${PRESENCE_REFRESH_MS / 1000}s`);
+  applyPresence("clientReady");
+  presenceHeartbeat = setInterval(() => applyPresence(), PRESENCE_REFRESH_MS);
+  console.log(`[presence] heartbeat active every ${PRESENCE_REFRESH_MS / 1000}s`);
 }
 
-// ----------------------------------------------------------------
-// 🖼️ เช็กว่าข้อความมีรูป/ไฟล์แนบ/Embed รูปไหม
-// ----------------------------------------------------------------
-function hasImageAttachment(message) {
-    const hasAttachmentImage = message.attachments.some(
-        (att) =>
-            att.contentType?.startsWith('image/') ||
-            /\.(png|jpe?g|gif|webp|bmp)$/i.test(att.name || '')
-    );
-
-    const hasEmbedImage = message.embeds?.some(
-        (embed) =>
-            embed.image?.url ||
-            embed.thumbnail?.url ||
-            embed.url?.match(/\.(png|jpe?g|gif|webp|bmp)$/i)
-    );
-
-    return hasAttachmentImage || hasEmbedImage;
-}
-
-// ----------------------------------------------------------------
-// 📜 Slash Command /autoreact
-// ----------------------------------------------------------------
-const commands = [
-    new SlashCommandBuilder()
-        .setName('autoreact')
-        .setDescription('ตั้งค่าระบบ Auto React')
-        .setDefaultMemberPermissions(PermissionsBitField.Flags.Administrator)
-
-        .addSubcommand((sub) =>
-            sub
-                .setName('add')
-                .setDescription('เพิ่ม/แก้ไขห้องสำหรับ Auto React')
-                .addChannelOption((opt) =>
-                    opt
-                        .setName('channel')
-                        .setDescription('ห้องที่ต้องการให้ react อัตโนมัติ')
-                        .addChannelTypes(ChannelType.GuildText)
-                        .setRequired(true)
-                )
-                .addStringOption((opt) =>
-                    opt
-                        .setName('emojis')
-                        .setDescription('อิโมจิที่จะ react คั่นด้วยช่องว่าง เช่น 😀 🔥 👍')
-                        .setRequired(true)
-                )
-                .addStringOption((opt) =>
-                    opt
-                        .setName('mode')
-                        .setDescription('React ข้อความแบบไหน')
-                        .setRequired(true)
-                        .addChoices(
-                            { name: 'ทุกข้อความ', value: 'all' },
-                            { name: 'เฉพาะข้อความที่มีรูป/ไฟล์แนบ', value: 'image_only' }
-                        )
-                )
-        )
-
-        .addSubcommand((sub) =>
-            sub
-                .setName('remove')
-                .setDescription('เอาห้องออกจากระบบ Auto React')
-                .addChannelOption((opt) =>
-                    opt
-                        .setName('channel')
-                        .setDescription('ห้องที่ต้องการเอาออก')
-                        .addChannelTypes(ChannelType.GuildText)
-                        .setRequired(true)
-                )
-        )
-
-        .addSubcommand((sub) =>
-            sub
-                .setName('list')
-                .setDescription('ดูรายการห้องที่ตั้ง Auto React ไว้ทั้งหมด')
-        )
-
-        .addSubcommand((sub) =>
-            sub
-                .setName('toggle')
-                .setDescription('เปิด/ปิดระบบ Auto React ทั้งหมด')
-        )
-
-        .addSubcommand((sub) =>
-            sub
-                .setName('scan')
-                .setDescription('สแกนข้อความย้อนหลังในห้องที่ตั้งค่าไว้ แล้วกด React ให้')
-                .addChannelOption((opt) =>
-                    opt
-                        .setName('channel')
-                        .setDescription('ห้องที่ต้องการสแกนย้อนหลัง')
-                        .addChannelTypes(ChannelType.GuildText)
-                        .setRequired(true)
-                )
-                .addIntegerOption((opt) =>
-                    opt
-                        .setName('limit')
-                        .setDescription('จำนวนข้อความย้อนหลังที่ต้องการสแกน 1-1000')
-                        .setMinValue(1)
-                        .setMaxValue(1000)
-                        .setRequired(false)
-                )
-        )
-
-        .addSubcommand((sub) =>
-            sub
-                .setName('clear')
-                .setDescription('ลบการตั้งค่าห้องทั้งหมดทิ้ง')
-        ),
-].map((cmd) => cmd.toJSON());
-
-// ----------------------------------------------------------------
-// 🚀 Ready
-// ----------------------------------------------------------------
-client.once('clientReady', async () => {
-    console.log(`🚀 ${client.user.tag} พร้อมทำงานแล้ว!`);
-
-    startPresenceHeartbeat();
-
-    const rest = new REST({ version: '10' }).setToken(TOKEN);
-
-    try {
-        const guildIds = client.guilds.cache.map((g) => g.id);
-
-        for (const guildId of guildIds) {
-            await rest.put(
-                Routes.applicationGuildCommands(client.user.id, guildId),
-                { body: commands }
-            );
-        }
-
-        console.log(`✅ ลงทะเบียน Slash Command สำเร็จใน ${guildIds.length} เซิร์ฟเวอร์`);
-    } catch (err) {
-        console.error('❌ ลงทะเบียน Slash Command ไม่สำเร็จ:', err);
-    }
+client.once(Events.ClientReady, (readyClient) => {
+  startPresenceHeartbeat();
+  console.log(`Logged in as ${readyClient.user.tag}`);
 });
 
-client.on('shardReady', (shardId) => applyPresence(`shardReady:${shardId}`));
-client.on('shardResume', (shardId) => applyPresence(`shardResume:${shardId}`));
+client.on("shardReady", (shardId) => applyPresence(`shardReady:${shardId}`));
+client.on("shardResume", (shardId) => applyPresence(`shardResume:${shardId}`));
 
-// ----------------------------------------------------------------
-// 🎯 Auto React ข้อความใหม่
-// ----------------------------------------------------------------
-client.on('messageCreate', async (message) => {
-    // ไม่ react ข้อความของบอทตัวเอง แต่ react ข้อความจากบอทอื่นได้ เช่น Kanopi
-    if (message.author.id === client.user.id) return;
+client.on(Events.InteractionCreate, async (interaction) => {
+  if (!interaction.isChatInputCommand() || interaction.commandName !== "autoreact") {
+    return;
+  }
 
-    if (!config.enabled) return;
+  if (!interaction.guildId) {
+    await interaction.reply({
+      content: "This command can only be used in a server.",
+      ephemeral: true
+    });
+    return;
+  }
 
-    const channelConfig = config.channels[message.channel.id];
-    if (!channelConfig) return;
+  const subcommand = interaction.options.getSubcommand();
 
-    const hasImage = hasImageAttachment(message);
-
-    const shouldReact =
-        channelConfig.mode === 'all' ||
-        (channelConfig.mode === 'image_only' && hasImage);
-
-    if (!shouldReact) return;
-
-    for (const emoji of channelConfig.emojis) {
-        try {
-            await message.react(emoji);
-        } catch (err) {
-            console.error(`⚠️ React อิโมจิ "${emoji}" ไม่สำเร็จ:`, err.message);
-        }
+  try {
+    if (subcommand === "add") {
+      await handleAdd(interaction);
+      return;
     }
+
+    if (subcommand === "list") {
+      await handleList(interaction);
+      return;
+    }
+
+    if (subcommand === "remove") {
+      await handleRemove(interaction);
+      return;
+    }
+
+    if (subcommand === "toggle") {
+      await handleToggle(interaction);
+      return;
+    }
+
+    if (subcommand === "scan") {
+      await handleScan(interaction);
+      return;
+    }
+
+    await interaction.reply({
+      content: `Unsupported subcommand: ${subcommand}`,
+      ephemeral: true
+    });
+  } catch (error) {
+    console.error(error);
+    const content = `Action failed: ${error.message}`;
+    if (interaction.deferred || interaction.replied) {
+      await interaction.editReply({ content });
+    } else {
+      await interaction.reply({ content, ephemeral: true });
+    }
+  }
 });
 
-// ----------------------------------------------------------------
-// 🛠️ จัดการ Slash Command /autoreact
-// ----------------------------------------------------------------
-client.on('interactionCreate', async (interaction) => {
-    if (!interaction.isChatInputCommand()) return;
-    if (interaction.commandName !== 'autoreact') return;
+client.on(Events.MessageCreate, async (message) => {
+  if (!message.guildId) return;
 
-    if (!interaction.memberPermissions?.has(PermissionsBitField.Flags.Administrator)) {
-        return interaction.reply({
-            content: '❌ คำสั่งนี้ใช้ได้เฉพาะแอดมินเท่านั้น',
-            ephemeral: true,
-        });
-    }
+  const rules = store
+    .listRules(message.guildId)
+    .filter((rule) => rule.enabled && rule.channelId === message.channelId);
 
-    const sub = interaction.options.getSubcommand();
+  if (rules.length === 0) return;
 
-    // ---------------- /autoreact add ----------------
-    if (sub === 'add') {
-        const channel = interaction.options.getChannel('channel');
-        const emojiInput = interaction.options.getString('emojis');
-        const mode = interaction.options.getString('mode');
+  const me = message.guild.members.me;
+  const permissions = message.channel.permissionsFor(me);
+  if (!permissions?.has(PermissionFlagsBits.AddReactions)) return;
 
-        // กัน emoji ซ้ำในห้องเดียวกัน
-        const emojis = [...new Set(emojiInput.split(/\s+/).filter(Boolean))];
+  for (const rule of rules) {
+    if (rule.ignoreBots && message.author.bot) continue;
+    if (!matchesRule(message.content ?? "", rule)) continue;
 
-        if (emojis.length === 0) {
-            return interaction.reply({
-                content: '❌ กรุณาใส่อิโมจิอย่างน้อย 1 ตัว',
-                ephemeral: true,
-            });
-        }
-
-        config.channels[channel.id] = { emojis, mode };
-        saveConfig();
-
-        const modeText = mode === 'all'
-            ? 'ทุกข้อความ'
-            : 'เฉพาะข้อความที่มีรูป/ไฟล์แนบ';
-
-        const embed = new EmbedBuilder()
-            .setColor(0x57f287)
-            .setTitle('✅ ตั้งค่า Auto React สำเร็จ')
-            .addFields(
-                { name: 'ห้อง', value: `<#${channel.id}>`, inline: true },
-                { name: 'โหมด', value: modeText, inline: true },
-                { name: 'อิโมจิ', value: emojis.join(' '), inline: false }
-            );
-
-        return interaction.reply({ embeds: [embed] });
-    }
-
-    // ---------------- /autoreact remove ----------------
-    if (sub === 'remove') {
-        const channel = interaction.options.getChannel('channel');
-
-        if (!config.channels[channel.id]) {
-            return interaction.reply({
-                content: `⚠️ ห้อง <#${channel.id}> ไม่ได้ตั้งค่า Auto React ไว้`,
-                ephemeral: true,
-            });
-        }
-
-        delete config.channels[channel.id];
-        saveConfig();
-
-        return interaction.reply(`🗑️ เอาห้อง <#${channel.id}> ออกจากระบบ Auto React แล้ว`);
-    }
-
-    // ---------------- /autoreact list ----------------
-    if (sub === 'list') {
-        const entries = Object.entries(config.channels);
-
-        if (entries.length === 0) {
-            return interaction.reply({
-                content: '📭 ยังไม่มีห้องไหนตั้งค่า Auto React ไว้เลย',
-                ephemeral: true,
-            });
-        }
-
-        const embed = new EmbedBuilder()
-            .setColor(0x5865f2)
-            .setTitle('📋 รายการห้อง Auto React')
-            .setDescription(`สถานะระบบ: ${config.enabled ? '🟢 เปิดทำงาน' : '🔴 ปิดทำงาน'}`);
-
-        for (const [channelId, data] of entries) {
-            const modeText = data.mode === 'all'
-                ? 'ทุกข้อความ'
-                : 'เฉพาะรูป/ไฟล์แนบ';
-
-            embed.addFields({
-                name: `<#${channelId}>`,
-                value: `โหมด: ${modeText}\nอิโมจิ: ${data.emojis.join(' ')}`,
-                inline: false,
-            });
-        }
-
-        return interaction.reply({ embeds: [embed] });
-    }
-
-    // ---------------- /autoreact toggle ----------------
-    if (sub === 'toggle') {
-        config.enabled = !config.enabled;
-        saveConfig();
-
-        const statusText = config.enabled ? 'เปิดทำงาน 🟢' : 'ปิดทำงาน 🔴';
-        return interaction.reply(`⚙️ ระบบ Auto React ตอนนี้: **${statusText}**`);
-    }
-
-    // ---------------- /autoreact scan ----------------
-    if (sub === 'scan') {
-        const channel = interaction.options.getChannel('channel');
-        const limit = interaction.options.getInteger('limit') ?? 100;
-
-        const channelConfig = config.channels[channel.id];
-
-        if (!channelConfig) {
-            return interaction.reply({
-                content: `⚠️ ห้อง <#${channel.id}> ยังไม่ได้ตั้งค่า Auto React ให้ใช้ /autoreact add ก่อน`,
-                ephemeral: true,
-            });
-        }
-
-        await interaction.deferReply({ ephemeral: true });
-
-        let remaining = limit;
-        let before;
-        let scanned = 0;
-        let reactedMessages = 0;
-        let reactionCount = 0;
-        let skipped = 0;
-
-        while (remaining > 0) {
-            const batchSize = Math.min(100, remaining);
-
-            const fetched = await channel.messages.fetch({
-                limit: batchSize,
-                before,
-            });
-
-            if (fetched.size === 0) break;
-
-            for (const msg of fetched.values()) {
-                scanned++;
-
-                // ไม่ react ข้อความของบอทตัวเอง แต่ react ข้อความจากบอทอื่นได้
-                if (msg.author.id === client.user.id) {
-                    skipped++;
-                    continue;
-                }
-
-                const hasImage = hasImageAttachment(msg);
-
-                const shouldReact =
-                    channelConfig.mode === 'all' ||
-                    (channelConfig.mode === 'image_only' && hasImage);
-
-                if (!shouldReact) {
-                    skipped++;
-                    continue;
-                }
-
-                let added = 0;
-
-                for (const emoji of channelConfig.emojis) {
-                    try {
-                        await msg.react(emoji);
-                        added++;
-                    } catch (err) {
-                        console.error(`⚠️ Scan react อิโมจิ "${emoji}" ไม่สำเร็จ:`, err.message);
-                    }
-                }
-
-                if (added > 0) {
-                    reactedMessages++;
-                    reactionCount += added;
-                }
-            }
-
-            before = fetched.last().id;
-            remaining -= fetched.size;
-
-            if (fetched.size < batchSize) break;
-        }
-
-        return interaction.editReply(
-            `✅ สแกนเสร็จแล้ว\n` +
-            `ห้อง: <#${channel.id}>\n` +
-            `อ่านข้อความ: ${scanned}\n` +
-            `React ให้ข้อความ: ${reactedMessages}\n` +
-            `จำนวน React ทั้งหมด: ${reactionCount}\n` +
-            `ข้าม: ${skipped}`
+    for (const emoji of getRuleEmojis(rule)) {
+      try {
+        await message.react(emoji);
+      } catch (error) {
+        console.warn(
+          `Could not react with "${emoji}" for rule ${rule.id}: ${error.message}`
         );
+      }
     }
-
-    // ---------------- /autoreact clear ----------------
-    if (sub === 'clear') {
-        config.channels = {};
-        saveConfig();
-
-        return interaction.reply('🧹 ล้างการตั้งค่าห้องทั้งหมดเรียบร้อยแล้ว');
-    }
+  }
 });
 
-// ----------------------------------------------------------------
-// ▶️ Start Bot
-// ----------------------------------------------------------------
-if (!TOKEN) {
-    console.error('❌ ไม่พบ DISCORD_TOKEN ใน .env');
-    process.exit(1);
+async function handleAdd(interaction) {
+  const channel = interaction.options.getChannel("channel", true);
+  const emojiText = getFirstStringOption(interaction, [
+    "emojis",
+    "emoji",
+    "reaction",
+    "reactions",
+    "emote",
+    "emotes"
+  ]);
+  const emojis = parseEmojiList(emojiText);
+  const keyword = interaction.options.getString("keyword")?.trim() ?? "";
+  const mode = interaction.options.getString("mode") ?? (keyword ? "contains" : "all");
+  const ignoreBots = interaction.options.getBoolean("ignore_bots") ?? false;
+
+  if (emojis.length === 0) {
+    await interaction.reply({
+      content: "Missing emojis. Fill the emojis option, for example: 🔥 or 🔥 ❤️",
+      ephemeral: true
+    });
+    return;
+  }
+
+  if (mode !== "all" && !keyword) {
+    await interaction.reply({
+      content: "Keyword is required when mode is not all.",
+      ephemeral: true
+    });
+    return;
+  }
+
+  if (mode === "regex") {
+    validateRegex(keyword);
+  }
+
+  const rule = await store.addRule(interaction.guildId, {
+    channelId: channel.id,
+    emoji: emojis[0],
+    emojis,
+    keyword,
+    mode,
+    ignoreBots
+  });
+
+  await interaction.reply({
+    content: `Added rule: \`${rule.id}\` | ${channel} | ${emojis.join(" ")} | mode: \`${mode}\``,
+    ephemeral: true
+  });
 }
 
-client.login(TOKEN);
+function getFirstStringOption(interaction, names) {
+  for (const name of names) {
+    const value = interaction.options.getString(name);
+    if (value?.trim()) return value.trim();
+  }
+  return "";
+}
+
+function parseEmojiList(value) {
+  return (value.match(/<a?:[a-zA-Z0-9_]+:\d+>|[^\s,]+/g) || [])
+    .map((item) => item.trim())
+    .filter(Boolean)
+    .slice(0, 20);
+}
+
+function getRuleEmojis(rule) {
+  if (Array.isArray(rule.emojis) && rule.emojis.length > 0) {
+    return rule.emojis;
+  }
+  if (rule.emoji) {
+    return [rule.emoji];
+  }
+  return [];
+}
+
+async function handleList(interaction) {
+  const rules = store.listRules(interaction.guildId);
+
+  if (rules.length === 0) {
+    await interaction.reply({
+      content: "No auto reaction rules in this server.",
+      ephemeral: true
+    });
+    return;
+  }
+
+  const lines = rules.map((rule) => {
+    const status = rule.enabled ? "on" : "off";
+    const keyword = rule.keyword ? ` | keyword: \`${rule.keyword}\`` : "";
+    const emojis = getRuleEmojis(rule).join(" ");
+    return `\`${rule.id}\` [${status}] <#${rule.channelId}> ${emojis} | mode: \`${rule.mode}\`${keyword}`;
+  });
+
+  await interaction.reply({
+    content: lines.join("\n").slice(0, 1900),
+    ephemeral: true
+  });
+}
+
+async function handleRemove(interaction) {
+  const id = interaction.options.getString("id", true);
+  const removed = await store.removeRule(interaction.guildId, id);
+
+  await interaction.reply({
+    content: removed ? `Removed rule \`${id}\`.` : `Rule \`${id}\` not found.`,
+    ephemeral: true
+  });
+}
+
+async function handleToggle(interaction) {
+  const id = interaction.options.getString("id", true);
+  const enabled = interaction.options.getBoolean("enabled", true);
+  const rule = await store.setRuleEnabled(interaction.guildId, id, enabled);
+
+  await interaction.reply({
+    content: rule
+      ? `Rule \`${id}\` is now ${enabled ? "on" : "off"}.`
+      : `Rule \`${id}\` not found.`,
+    ephemeral: true
+  });
+}
+
+async function handleScan(interaction) {
+  await interaction.deferReply({ ephemeral: true });
+
+  const rules = store
+    .listRules(interaction.guildId)
+    .filter((rule) => rule.enabled && getRuleEmojis(rule).length > 0);
+
+  if (rules.length === 0) {
+    await interaction.editReply("No enabled auto reaction rules to scan.");
+    return;
+  }
+
+  const rulesByChannel = new Map();
+  for (const rule of rules) {
+    const channelRules = rulesByChannel.get(rule.channelId) ?? [];
+    channelRules.push(rule);
+    rulesByChannel.set(rule.channelId, channelRules);
+  }
+
+  const member =
+    interaction.guild.members.me ?? (await interaction.guild.members.fetchMe());
+  let checked = 0;
+  let reacted = 0;
+  let skippedChannels = 0;
+  let errors = 0;
+
+  for (const [channelId, channelRules] of rulesByChannel) {
+    let channel;
+    try {
+      channel =
+        interaction.guild.channels.cache.get(channelId) ??
+        (await interaction.guild.channels.fetch(channelId));
+    } catch {
+      skippedChannels++;
+      continue;
+    }
+
+    if (!channel?.isTextBased?.() || !channel.messages?.fetch) {
+      skippedChannels++;
+      continue;
+    }
+
+    const permissions = channel.permissionsFor(member);
+    if (
+      !permissions?.has(PermissionFlagsBits.ViewChannel) ||
+      !permissions?.has(PermissionFlagsBits.ReadMessageHistory) ||
+      !permissions?.has(PermissionFlagsBits.AddReactions)
+    ) {
+      skippedChannels++;
+      continue;
+    }
+
+    let messages;
+    try {
+      messages = await channel.messages.fetch({ limit: 50 });
+    } catch {
+      errors++;
+      continue;
+    }
+
+    for (const message of messages.values()) {
+      checked++;
+      for (const rule of channelRules) {
+        if (rule.ignoreBots && message.author.bot) continue;
+        if (!matchesRule(message.content ?? "", rule)) continue;
+
+        for (const emoji of getRuleEmojis(rule)) {
+          try {
+            await message.react(emoji);
+            reacted++;
+          } catch {
+            errors++;
+          }
+        }
+      }
+    }
+  }
+
+  await interaction.editReply(
+    `Scan done. Checked ${checked} messages, added ${reacted} reactions, skipped ${skippedChannels} channels, errors ${errors}.`
+  );
+}
+
+function matchesRule(content, rule) {
+  const mode = rule.mode || "all";
+  if (mode === "all") return true;
+  if (!rule.keyword) return false;
+
+  const normalizedContent = content.toLocaleLowerCase();
+  const normalizedKeyword = rule.keyword.toLocaleLowerCase();
+
+  if (mode === "exact") {
+    return normalizedContent.trim() === normalizedKeyword.trim();
+  }
+
+  if (mode === "regex") {
+    return new RegExp(rule.keyword, "i").test(content);
+  }
+
+  return normalizedContent.includes(normalizedKeyword);
+}
+
+function validateRegex(pattern) {
+  try {
+    new RegExp(pattern);
+  } catch {
+    throw new Error("Invalid regex pattern.");
+  }
+}
+
+client.login(DISCORD_TOKEN);
